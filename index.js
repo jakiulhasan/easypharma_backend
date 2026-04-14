@@ -147,6 +147,13 @@ async function run() {
           return res.status(400).json({ error: "No inventory items provided" });
         }
 
+        // Validate user email
+        if (!user || !user.email) {
+          return res
+            .status(400)
+            .json({ error: "User information is required" });
+        }
+
         let inventoryCount = 0;
         let buyHistoryCount = 0;
 
@@ -159,12 +166,16 @@ async function run() {
             for (const item of inventoryItems) {
               const existingInventory = await inventoryList.findOne({
                 medicineId: item.medicineId,
+                user: user.email, // Check for user-specific inventory
               });
 
               if (existingInventory) {
                 // Update existing inventory - add quantity
                 await inventoryList.updateOne(
-                  { medicineId: item.medicineId },
+                  {
+                    medicineId: item.medicineId,
+                    user: user.email,
+                  },
                   {
                     $inc: { quantity: item.quantity },
                     $set: {
@@ -174,17 +185,18 @@ async function run() {
                       sellPrice: item.sellPrice,
                       expiry: item.expiry,
                       location: item.location,
-                      user: item.user,
+                      user: user.email,
                       updatedAt: new Date(),
                     },
                   },
                   { session },
                 );
               } else {
-                // Insert new inventory item
+                // Insert new inventory item with user email
                 await inventoryList.insertOne(
                   {
                     ...item,
+                    user: user.email,
                     createdAt: new Date(),
                     updatedAt: new Date(),
                   },
@@ -194,11 +206,12 @@ async function run() {
               inventoryCount++;
             }
 
-            // Add to buy history
+            // Add to buy history with user email
             if (buyHistoryItems && buyHistoryItems.length > 0) {
               // Add purchase summary to each buy history item
               const buyHistoryWithSummary = buyHistoryItems.map((item) => ({
                 ...item,
+                user: user.email,
                 purchaseSummary: {
                   subTotal,
                   commission,
@@ -231,7 +244,28 @@ async function run() {
       }
     });
 
-    // GET /api/inventory/all - Get all inventory items
+    // GET /api/inventory/user/:email - Get inventory for specific user
+    app.get("/api/inventory/user/:email", async (req, res) => {
+      try {
+        const { email } = req.params;
+
+        if (!email) {
+          return res.status(400).json({ error: "User email is required" });
+        }
+
+        const inventory = await inventoryList
+          .find({ user: email })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.json(inventory);
+      } catch (error) {
+        console.error("Error fetching user inventory:", error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // GET /api/inventory/all - Get all inventory items (admin only - keep for admin purposes)
     app.get("/api/inventory/all", async (req, res) => {
       try {
         const inventory = await inventoryList
@@ -245,7 +279,7 @@ async function run() {
       }
     });
 
-    // GET /api/inventory - Get inventory with filters
+    // GET /api/inventory - Get inventory with filters (user-specific)
     app.get("/api/inventory", async (req, res) => {
       try {
         const { user, location, medicineId } = req.query;
@@ -263,15 +297,16 @@ async function run() {
       }
     });
 
-    // GET /api/inventory/low-stock - Get low stock items (quantity < threshold)
+    // GET /api/inventory/low-stock - Get low stock items for specific user
     app.get("/api/inventory/low-stock", async (req, res) => {
       try {
         const threshold = parseInt(req.query.threshold) || 10;
-        const lowStockItems = await inventoryList
-          .find({
-            quantity: { $lt: threshold },
-          })
-          .toArray();
+        const { user } = req.query;
+
+        let query = { quantity: { $lt: threshold } };
+        if (user) query.user = user;
+
+        const lowStockItems = await inventoryList.find(query).toArray();
         res.json(lowStockItems);
       } catch (error) {
         console.error("Error fetching low stock items:", error);
@@ -279,22 +314,25 @@ async function run() {
       }
     });
 
-    // GET /api/inventory/expiring - Get expiring items
+    // GET /api/inventory/expiring - Get expiring items for specific user
     app.get("/api/inventory/expiring", async (req, res) => {
       try {
         const days = parseInt(req.query.days) || 30;
+        const { user } = req.query;
         const today = new Date();
         const futureDate = new Date();
         futureDate.setDate(today.getDate() + days);
 
-        const expiringItems = await inventoryList
-          .find({
-            expiry: {
-              $gte: today.toISOString().split("T")[0],
-              $lte: futureDate.toISOString().split("T")[0],
-            },
-          })
-          .toArray();
+        let query = {
+          expiry: {
+            $gte: today.toISOString().split("T")[0],
+            $lte: futureDate.toISOString().split("T")[0],
+          },
+        };
+
+        if (user) query.user = user;
+
+        const expiringItems = await inventoryList.find(query).toArray();
         res.json(expiringItems);
       } catch (error) {
         console.error("Error fetching expiring items:", error);
@@ -302,15 +340,38 @@ async function run() {
       }
     });
 
-    // PUT /api/inventory/:id - Update inventory item
+    // PUT /api/inventory/:id - Update inventory item (with user verification)
     app.put("/api/inventory/:id", async (req, res) => {
       try {
         const { id } = req.params;
-        const { quantity, buyPrice, sellPrice, expiry, location, type } =
-          req.body;
+        const {
+          quantity,
+          buyPrice,
+          sellPrice,
+          expiry,
+          location,
+          type,
+          userEmail,
+        } = req.body;
+
+        // First, find the inventory item
+        const inventoryItem = await inventoryList.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!inventoryItem) {
+          return res.status(404).json({ error: "Inventory item not found" });
+        }
+
+        // Verify ownership
+        if (inventoryItem.user !== userEmail) {
+          return res
+            .status(403)
+            .json({ error: "You don't have permission to update this item" });
+        }
 
         const result = await inventoryList.updateOne(
-          { _id: new ObjectId(id) },
+          { _id: new ObjectId(id), user: userEmail },
           {
             $set: {
               quantity,
@@ -339,11 +400,32 @@ async function run() {
       }
     });
 
-    // DELETE /api/inventory/:id - Remove inventory item
+    // DELETE /api/inventory/:id - Remove inventory item (with user verification)
     app.delete("/api/inventory/:id", async (req, res) => {
       try {
         const { id } = req.params;
-        const result = await inventoryList.deleteOne({ _id: new ObjectId(id) });
+        const { userEmail } = req.body;
+
+        // First, find the inventory item
+        const inventoryItem = await inventoryList.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!inventoryItem) {
+          return res.status(404).json({ error: "Inventory item not found" });
+        }
+
+        // Verify ownership
+        if (inventoryItem.user !== userEmail) {
+          return res
+            .status(403)
+            .json({ error: "You don't have permission to delete this item" });
+        }
+
+        const result = await inventoryList.deleteOne({
+          _id: new ObjectId(id),
+          user: userEmail,
+        });
 
         if (result.deletedCount === 0) {
           return res.status(404).json({ error: "Inventory item not found" });
@@ -361,7 +443,7 @@ async function run() {
 
     // ==================== BUY HISTORY ROUTES ====================
 
-    // GET /api/buy-history - Get buy history
+    // GET /api/buy-history - Get buy history for specific user
     app.get("/api/buy-history", async (req, res) => {
       try {
         const { user, startDate, endDate, medicineId } = req.query;
@@ -387,7 +469,7 @@ async function run() {
       }
     });
 
-    // GET /api/buy-history/summary - Get purchase summary by date range
+    // GET /api/buy-history/summary - Get purchase summary by date range for specific user
     app.get("/api/buy-history/summary", async (req, res) => {
       try {
         const { startDate, endDate, user } = req.query;
@@ -434,18 +516,26 @@ async function run() {
 
     // ==================== DASHBOARD STATS ====================
 
-    // GET /api/dashboard/stats - Get dashboard statistics
+    // GET /api/dashboard/stats - Get dashboard statistics for specific user
     app.get("/api/dashboard/stats", async (req, res) => {
       try {
+        const { user } = req.query;
+        let query = {};
+
+        if (user) query.user = user;
+
         const totalMedicines = await medicinelist.countDocuments();
-        const totalInventoryItems = await inventoryList.countDocuments();
+        const totalInventoryItems = await inventoryList.countDocuments(query);
         const totalQuantity = await inventoryList
-          .aggregate([{ $group: { _id: null, total: { $sum: "$quantity" } } }])
+          .aggregate([
+            { $match: query },
+            { $group: { _id: null, total: { $sum: "$quantity" } } },
+          ])
           .toArray();
 
-        const lowStockItems = await inventoryList.countDocuments({
-          quantity: { $lt: 10 },
-        });
+        const lowStockQuery = { quantity: { $lt: 10 } };
+        if (user) lowStockQuery.user = user;
+        const lowStockItems = await inventoryList.countDocuments(lowStockQuery);
 
         res.json({
           totalMedicines,
